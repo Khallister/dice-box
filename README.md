@@ -1,6 +1,6 @@
 # Dice-Box &middot; [![GitHub license](https://img.shields.io/badge/license-MIT-blue.svg)](https://github.com/frankieali/infima-extras/blob/main/LICENSE) [![npm version](https://img.shields.io/npm/v/@3d-dice/dice-box.svg?style=flat)](https://www.npmjs.com/package/@3d-dice/dice-box)
 
-High performance 3D dice roller module made with [BabylonJS](https://www.babylonjs.com/), [AmmoJS](https://github.com/kripken/ammo.js/) and implemented with [web workers](https://developer.mozilla.org/en-US/docs/Web/API/Web_Workers_API/Using_web_workers) and [offscreenCanvas](https://doc.babylonjs.com/divingDeeper/scene/offscreenCanvas). Designed to be easy to integrate into your own JavaScript app.
+High performance 3D dice roller module made with [BabylonJS](https://www.babylonjs.com/), [Rapier](https://rapier.rs/) (`@dimforge/rapier3d-compat`, WASM inlined, so no physics asset needs to be served) and implemented with [web workers](https://developer.mozilla.org/en-US/docs/Web/API/Web_Workers_API/Using_web_workers) and [offscreenCanvas](https://doc.babylonjs.com/divingDeeper/scene/offscreenCanvas). Designed to be easy to integrate into your own JavaScript app.
 
 ![Demo Screenshot](https://github.com/3d-dice/dice-box/blob/main/dice-screenshot.jpg)
 
@@ -198,3 +198,29 @@ My favorite theme for this project has been the Dice of Rolling theme based on t
 
 ### Owlbear Rodeo
 Another great platform if all you need is an interactive virtual map and dice. [Owlbear Rodeo](https://www.owlbear.rodeo/) has created really amazing tools that work well for any platform. Bring your own character sheets.
+
+
+## Instance lifecycle (local fork)
+
+Call `destroy()` when a component unmounts or leaves its route. It is synchronous,
+idempotent, and returns the instance. `dispose()` is an alias, and `destroyed`
+reports whether the instance has been released.
+
+```js
+const box = new DiceBox({ container: '#dice-box', offscreen: false })
+const ready = box.init()
+// Safe even while initialization or a roll is pending:
+box.destroy()
+await ready.catch(error => {
+  if (error.name !== 'AbortError') throw error
+})
+```
+
+Destruction terminates the physics and rendering workers, closes message ports,
+cancels pending animation frames and timers, removes the resize listener, disposes
+the onscreen scene and engine, and removes the canvas created by this instance.
+Pending initialization and roll promises reject with `AbortError`; catch those
+promises in the host application. A destroyed instance cannot be initialized or
+rolled again. `clear()` remains reusable while the instance is alive.
+
+Run isolated lifecycle checks with `node --test tests/lifecycle.test.mjs`.

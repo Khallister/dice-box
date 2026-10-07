@@ -15,7 +15,7 @@ const defaultOptions = {
 	externalThemes: {}, // point to CDN paths
 	themeColor: '#2e8555', // used for color values or named theme variants - not fully implemented yet // green: #2e8555 // yellow: #feea03
 	offscreen: true, // use offscreen canvas browser feature for performance improvements - will fallback to false based on feature detection
-	assetPath: '/assets/dice-box/', // path to 'ammo', 'themes' folders and web workers
+	assetPath: '/assets/dice-box/', // path to the 'themes' folder
 	// origin: location.origin,
 	origin: typeof window !== "undefined" ? window.location.origin : "",
 	suspendSimulation: false
@@ -38,6 +38,17 @@ class WorldFacade {
 	#dicePhysicsPromise
 	#dicePhysicsResolve
 	#webgl_support = true
+	#destroyed = false
+	#initPromise
+	#abortController = new AbortController()
+	#channel
+	#resizeHandler
+
+	get destroyed() { return this.#destroyed }
+
+	#assertLive() {
+		if (this.#destroyed) throw new DOMException('DiceBox has been destroyed', 'AbortError')
+	}
 	noop = () => {}
 
   constructor(options = {}){
@@ -85,6 +96,7 @@ class WorldFacade {
 
 	// Load the BabylonJS World
 	async #loadWorld(){
+		this.#assertLive()
 
 		// set up a promise to be fulfilled when a message comes back from DiceWorld indicating init is complete
 		this.#diceWorldPromise = new Promise((resolve, reject) => {
@@ -93,12 +105,13 @@ class WorldFacade {
 
 		// resolve the promise one onInitComplete callback is triggered
 		const onInitComplete = () => {
-			this.#diceWorldResolve()
+			if (!this.#destroyed) this.#diceWorldResolve()
 		}
 
     if(!this.#webgl_support){
       console.warn('This browser does not support WebGL which is required for 3D rendering. Falling back to random number generator')
       const WorldNone = await import('./components/world.none').then(module => module.default)
+			this.#assertLive()
       this.#DiceWorld = new WorldNone({
 				canvas: this.canvas,
 				options: this.config,
@@ -108,6 +121,7 @@ class WorldFacade {
 		else if ("OffscreenCanvas" in window && "transferControlToOffscreen" in this.canvas && this.config.offscreen) {
 			// Ok to use offscreen canvas - transfer control offscreen
 			const WorldOffscreen = await import('./components/world.offscreen').then(module => module.default)
+			this.#assertLive()
 			// WorldOffscreen is just a container class that passes all method calls to the Offscreen Canvas worker
 			this.#DiceWorld = new WorldOffscreen({
 				canvas: this.canvas,
@@ -121,23 +135,27 @@ class WorldFacade {
 			}
 			// code splitting out WorldOnscreen. It's essentially the same as offscreenCanvas.worker.js but communicates with the main thread differently
 			const WorldOnscreen = await import('./components/world.onscreen').then(module => module.default)
+			this.#assertLive()
 			this.#DiceWorld = new WorldOnscreen({
 				canvas: this.canvas,
 				options: this.config,
 				onInitComplete
 			})
 		}
+		await this.#DiceWorld.initialized
+		this.#assertLive()
 	}
 
-	// Load the AmmoJS physics world
+	// Load the Rapier physics world
 	#loadPhysics(){
-		// initialize physics world in which AmmoJS runs
+		// initialize the physics worker in which Rapier runs
 		this.#DicePhysics = new physicsWorker()
 		// set up a promise to be fulfilled when a message comes back from physics.worker indicating init is complete
 		this.#dicePhysicsPromise = new Promise((resolve, reject) => {
 			this.#dicePhysicsResolve = resolve
 		})
 		this.#DicePhysics.onmessage = (e) => {
+			if (this.#destroyed) return
 			switch( e.data.action ) {
 				case "init-complete":
 					this.#dicePhysicsResolve(); // fulfill promise so other things can run
@@ -149,7 +167,7 @@ class WorldFacade {
                     break;
 			}
     }
-		// initialize the AmmoJS physics worker
+		// initialize the Rapier physics worker
 		this.#DicePhysics.postMessage({
 			action: "init",
 			width: this.canvas.clientWidth,
@@ -159,7 +177,7 @@ class WorldFacade {
 	}
 
 	#connectWorld(){
-		const channel = new MessageChannel()
+		const channel = this.#channel = new MessageChannel()
 		
 		// create message channel for the visual world and the physics world to communicate through
 		this.#DiceWorld.connect(channel.port1)
@@ -171,18 +189,36 @@ class WorldFacade {
 	}
 
 	resizeWorld(){
+		if (this.#destroyed || !this.canvas) return
+		if (this.#resizeHandler) { this.#resizeHandler(); return }
 		// send resize events to workers - debounced for performance
 		const resizeWorkers = () => {
+			if (this.#destroyed) return
 			this.#DiceWorld.resize({width: this.canvas.clientWidth, height: this.canvas.clientHeight})
 			if(this.#DicePhysics){
 				this.#DicePhysics.postMessage({action: "resize", width: this.canvas.clientWidth, height: this.canvas.clientHeight});
 			}
 		}
-		const debounceResize = debounce(resizeWorkers)
-		window.addEventListener("resize", debounceResize)
+		this.#resizeHandler = debounce(resizeWorkers)
+		window.addEventListener("resize", this.#resizeHandler)
 	}
 
-  async init() {
+	init() {
+		this.#assertLive()
+		if (!this.#initPromise) {
+			const signal = this.#abortController.signal
+			let onAbort
+			const canceled = new Promise((resolve, reject) => {
+				onAbort = () => reject(new DOMException('DiceBox has been destroyed', 'AbortError'))
+				signal.addEventListener('abort', onAbort, {once: true})
+			})
+			this.#initPromise = Promise.race([this.#initialize(), canceled])
+				.finally(() => signal.removeEventListener('abort', onAbort))
+		}
+		return this.#initPromise
+	}
+
+  async #initialize() {
 		// trigger physics first so it can load in parallel with world
     if(this.#webgl_support){
       this.#loadPhysics()
@@ -190,10 +226,12 @@ class WorldFacade {
       this.#dicePhysicsPromise = Promise.resolve()
     }
 		await this.#loadWorld()
+		this.#assertLive()
 		this.resizeWorld()
 
 		// now that DiceWorld is ready we can attach our callbacks
 		this.#DiceWorld.onRollResult = (result) => {
+			if (this.#destroyed || !this.rollDiceData[result.rollId]) return
 			const die = this.rollDiceData[result.rollId]
 			const group = this.rollGroupData[die.groupId]
 			const collection = this.rollCollectionData[die.collectionId]
@@ -215,11 +253,13 @@ class WorldFacade {
 			this.onDieComplete(returnDie)
 		}
 		this.#DiceWorld.onRollComplete = () => {
+			if (this.#destroyed) return
 			// trigger callback passing the roll results
 			this.onRollComplete(this.getRollResults())
 		}
 
 		this.#DiceWorld.onDieRemoved = (rollId) => {
+			if (this.#destroyed || !this.rollDiceData[rollId]) return
 			// get die information from cache
 			let die = this.rollDiceData[rollId]
 			const collection = this.rollCollectionData[die.removeCollectionId]
@@ -248,6 +288,7 @@ class WorldFacade {
 
     // wait for both DiceWorld and DicePhysics to initialize
 		await Promise.all([this.#diceWorldPromise, this.#dicePhysicsPromise])
+		this.#assertLive()
     
     if(this.#DicePhysics){
       // set up message channels between Dice World and Dice Physics
@@ -256,12 +297,15 @@ class WorldFacade {
 
 		// queue load of the theme defined in the config
 		await this.loadThemeQueue.push(() => this.loadTheme(this.config.theme))
+		this.#assertLive()
 		
 		// queue load of other defined themes
 
-		this.config.preloadThemes.forEach(async function(theme) {
-			await this.loadThemeQueue.push(() => this.loadTheme(theme))
-		}.bind(this))
+		this.config.preloadThemes.forEach(theme => {
+			this.loadThemeQueue.push(() => this.loadTheme(theme)).catch(error => {
+				if (!this.#destroyed) console.error(error)
+			})
+		})
 
 
 		//TODO: this should probably return a promise
@@ -271,6 +315,7 @@ class WorldFacade {
 
 	// fetch the theme config and return a themeData object
 	async getThemeConfig(theme){
+		this.#assertLive()
 		let basePath = `${this.config.origin}${this.config.assetPath}themes/${theme}`
 
 		if(this.config.externalThemes[theme]){
@@ -279,7 +324,7 @@ class WorldFacade {
 
 
 		// fetch the theme.config file
-		let themeData = await fetch(`${basePath}/theme.config.json`).then(resp => {
+		let themeData = await fetch(`${basePath}/theme.config.json`, {signal: this.#abortController.signal}).then(resp => {
 			if(resp.ok) {
 				const contentType = resp.headers.get("content-type")
 				if (contentType && contentType.indexOf("application/json") !== -1) {
@@ -295,7 +340,8 @@ class WorldFacade {
 			} else {
 				throw new Error(`Unable to fetch config file for theme: '${theme}'. Request rejected with status ${resp.status}: ${resp.statusText}`)
 			}
-		}).catch(error => console.error(error))
+		})
+		this.#assertLive()
 
 		if(!themeData){
 			throw new Error("No theme config data to work with.")
@@ -320,7 +366,8 @@ class WorldFacade {
 		// example: diceOfRolling-fate extends diceOfRolling. You can now roll 3dfate with the theme: 'diceOfRolling'
 
 		if(themeData.hasOwnProperty("extends")){
-			const target = await this.loadTheme(themeData.extends).catch(error => console.error(error))
+			const target = await this.loadTheme(themeData.extends)
+			this.#assertLive()
 
 			// can not extend a theme that extends another theme
 			if(target.hasOwnProperty("extends")){
@@ -353,6 +400,7 @@ class WorldFacade {
 	}
 
 	async loadTheme(theme){
+		if (this.#destroyed) return
 		// check the cache
 		if(this.themesLoadedData[theme]) {
 			// short circuit if theme has been previously loaded
@@ -362,14 +410,18 @@ class WorldFacade {
 		// console.log(`${theme} is loading ...`)
 
 		// fetch and save the themeData for later
-		const themeConfig = this.themesLoadedData[theme] = await this.getThemeConfig(theme).catch(error => console.error(error))
+		const themeConfig = await this.getThemeConfig(theme)
+		this.#assertLive()
 		this.onThemeConfigLoaded(themeConfig)
+		this.#assertLive()
 
 		if(!themeConfig) return
 
 		// pass config onto DiceWorld to load - the theme loader needs 'scene' from DiceWorld
-		await this.#DiceWorld.loadTheme(themeConfig).catch(error => console.error(error))
+		await this.#DiceWorld.loadTheme(themeConfig)
+		this.#assertLive()
 
+		this.themesLoadedData[theme] = themeConfig
 		this.onThemeLoaded(themeConfig)
 
 		return themeConfig
@@ -378,6 +430,7 @@ class WorldFacade {
 	// TODO: use getter and setter
 	// change config options
 	async updateConfig(options) {
+		this.#assertLive()
 		const newConfig = {...this.config,...options}
 		// console.log('newConfig', newConfig)
 		// const config = await this.loadThemeQueue.push(() => this.loadTheme(newConfig.theme))
@@ -387,6 +440,7 @@ class WorldFacade {
 
 		if(newConfig.theme){
 			const config = await this.loadThemeQueue.push(() => this.loadTheme(newConfig.theme))
+			this.#assertLive()
 			const themeData = config.at(-1) //get the last entry returned from the queue
 			if(themeData.hasOwnProperty("extends")){
 				// set the theme to the parent theme
@@ -410,6 +464,7 @@ class WorldFacade {
 	}
 
 	clear() {
+		if (this.#destroyed) return this
 		// reset indexes
 		this.#collectionIndex = 0
 		this.#groupIndex = 0
@@ -430,7 +485,46 @@ class WorldFacade {
 		return this
   }
 
+	/** Permanently release this instance. Pending work rejects with AbortError. */
+	destroy() {
+		if (this.#destroyed) return this
+		this.#destroyed = true
+		this.#abortController.abort()
+		this.#diceWorldResolve?.()
+		this.#dicePhysicsResolve?.()
+		if (this.#resizeHandler) {
+			window.removeEventListener('resize', this.#resizeHandler)
+			this.#resizeHandler.cancel()
+			this.#resizeHandler = undefined
+		}
+		this.#DiceWorld.destroy?.()
+		this.#DiceWorld = {}
+		if (this.#DicePhysics) {
+			this.#DicePhysics.onmessage = null
+			this.#DicePhysics.terminate()
+			this.#DicePhysics = undefined
+		}
+		this.#channel?.port1.close()
+		this.#channel?.port2.close()
+		this.#channel = undefined
+		for (const collection of Object.values(this.rollCollectionData)) {
+			collection.promise.catch(this.noop)
+			collection.reject(new DOMException('DiceBox has been destroyed', 'AbortError'))
+		}
+		this.rollCollectionData = {}
+		this.rollGroupData = {}
+		this.rollDiceData = {}
+		this.themesLoadedData = {}
+		// createCanvas always creates a canvas owned by this instance.
+		this.canvas?.remove()
+		this.isVisible = false
+		return this
+	}
+
+	dispose() { return this.destroy() }
+
 	hide(className) {
+		this.#assertLive()
 		if(className){
 			this.canvas.dataset.hideClass = className
 			this.canvas.classList.add(className)
@@ -445,6 +539,7 @@ class WorldFacade {
 	}
 
 	show() {
+		this.#assertLive()
 		const hideClass = this.canvas.dataset?.hideClass
 		if(hideClass){
 			delete this.canvas.dataset.hideClass
@@ -461,6 +556,7 @@ class WorldFacade {
 
 	// TODO: pass data with roll - such as roll name. Passed back at the end in the results
 	roll(notation, {theme = this.config.theme, themeColor = this.config.themeColor, newStartPoint = true} = {}) {
+		this.#assertLive()
 		// note: to add to a roll on screen use .add method
 		// reset the offscreen worker and physics worker with each new roll
 		this.clear()
@@ -475,13 +571,14 @@ class WorldFacade {
 		})
 
 		const parsedNotation = this.createNotationArray(notation, this.themesLoadedData[theme].diceAvailable)
-		this.#makeRoll(parsedNotation, collectionId)
+		this.#makeRoll(parsedNotation, collectionId).catch(error => this.rollCollectionData[collectionId]?.reject(error))
 
 		// returns a Promise that is resolved in onRollComplete
 		return this.rollCollectionData[collectionId].promise
 	}
 
   add(notation, {theme = this.config.theme, themeColor = this.config.themeColor, newStartPoint = true} = {}) {
+		this.#assertLive()
 
 		const collectionId = this.#collectionIndex++
 
@@ -494,13 +591,14 @@ class WorldFacade {
 		})
 		
 		const parsedNotation = this.createNotationArray(notation, this.themesLoadedData[theme].diceAvailable)
-		this.#makeRoll(parsedNotation, collectionId)
+		this.#makeRoll(parsedNotation, collectionId).catch(error => this.rollCollectionData[collectionId]?.reject(error))
 
 		// returns a Promise that is resolved in onRollComplete
 		return this.rollCollectionData[collectionId].promise
   }
 
 	reroll(notation, {remove = false, hide = false, newStartPoint = true} = {}) {
+		this.#assertLive()
 		// TODO: add hide if you want to keep the die result for an external parser
 
 		// ensure notation is an array
@@ -518,6 +616,7 @@ class WorldFacade {
 	}
 
 	remove(notation, {hide = false} = {}) {
+		this.#assertLive()
 		// ensure notation is an array
 		const rollArray = Array.isArray(notation) ? notation : [notation]
 
@@ -549,14 +648,16 @@ class WorldFacade {
 
 	// used by both .add and .roll - .roll clears the box and .add does not
 	async #makeRoll(parsedNotation, collectionId){
+		if (this.#destroyed) return
 
 		this.onBeforeRoll(parsedNotation)
+		if (this.#destroyed) return
 
 		const collection = this.rollCollectionData[collectionId]
 		let newStartPoint = collection.newStartPoint
 
 		// loop through the number of dice in the group and roll each one
-		parsedNotation.forEach(async notation => {
+		await Promise.all(parsedNotation.map(async notation => {
 			if(!notation.sides) {
 				throw new Error("Improper dice notation or unable to parse notation")
 			}
@@ -568,7 +669,8 @@ class WorldFacade {
 			
 			// load the theme, will be short circuited if previously loaded
 			const loadTheme = () => this.loadTheme(theme)
-			await this.loadThemeQueue.push(loadTheme)
+			await this.loadThemeQueue.push(loadTheme).catch(error => { if (!this.#destroyed) throw error })
+			if (this.#destroyed) return
 
 			// const {meshName, diceAvailable, diceInherited = {}, material: { type: materialType }} = this.themesLoadedData[theme]
 			let meshName = this.themesLoadedData[theme].meshName
@@ -581,7 +683,8 @@ class WorldFacade {
 			if(diceExtra && diceExtra.includes(notation.sides)){
 				theme = diceExtended[notation.sides]
 				const loadExtendedTheme = () => this.loadTheme(theme)
-				this.loadThemeQueue.push(loadExtendedTheme)
+				await this.loadThemeQueue.push(loadExtendedTheme).catch(error => { if (!this.#destroyed) throw error })
+				if (this.#destroyed) return
 				meshName = this.themesLoadedData[theme].meshName
 				diceAvailable = this.themesLoadedData[theme]?.diceAvailable
 				materialType = this.themesLoadedData[theme]?.material?.type
@@ -674,7 +777,7 @@ class WorldFacade {
 				this.rollGroupData[index] = notation
 				++this.#groupIndex
 			}
-		})
+		}))
 	}
 
 	// accepts simple notations eg: 4d6

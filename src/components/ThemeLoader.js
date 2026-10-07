@@ -31,6 +31,8 @@ CustomMaterial.prototype.clone = function (name)  {
 }
 
 class ThemeLoader {
+	#destroyed = false
+	#pendingTextures = new Set()
   loadedThemes = {}
   themeData = {}
   constructor(options) {
@@ -38,6 +40,7 @@ class ThemeLoader {
   }
 
   async loadStandardMaterial(options) {
+		if (this.#destroyed) throw new DOMException('DiceBox has been destroyed', 'AbortError')
     const {theme, material: matParams} = options
     //TODO: apply more matParams
     const diceMaterial = new StandardMaterial(theme, this.scene);
@@ -45,12 +48,15 @@ class ThemeLoader {
     // TODO: make these methods reusable getDiffuseTexture(matParams, material)
     if(matParams.diffuseTexture){
       diceMaterial.diffuseTexture = await this.getTexture('diffuse', options)
+			if (this.#destroyed) throw new DOMException('DiceBox has been destroyed', 'AbortError')
     }
     if(matParams.bumpTexture){
       diceMaterial.bumpTexture = await this.getTexture('bump', options)
+			if (this.#destroyed) throw new DOMException('DiceBox has been destroyed', 'AbortError')
     }
     if(matParams.specularTexture){
       diceMaterial.specularTexture = await this.getTexture('specular', options)
+			if (this.#destroyed) throw new DOMException('DiceBox has been destroyed', 'AbortError')
     }
 
     diceMaterial.allowShaderHotSwapping = false
@@ -69,6 +75,7 @@ class ThemeLoader {
 
   // this will create two materials - one with light text and one with dark text, the underlying color can be changed by color instance buffers
   async loadColorMaterial(options) {
+		if (this.#destroyed) throw new DOMException('DiceBox has been destroyed', 'AbortError')
     const {theme, material: matParams} = options
     // create the custom color material with white/light numbers
     const diceMatLight = new CustomMaterial(theme+'_light',this.scene)
@@ -83,12 +90,15 @@ class ThemeLoader {
     if(matParams.diffuseTexture && matParams.diffuseTexture.light){
       opts.material.diffuseTexture = options.material.diffuseTexture.light
       diceMatLight.diffuseTexture = await this.getTexture('diffuse', opts)
+			if (this.#destroyed) throw new DOMException('DiceBox has been destroyed', 'AbortError')
     }
     if(matParams.bumpTexture){
       diceMatLight.bumpTexture = await this.getTexture('bump', options)
+			if (this.#destroyed) throw new DOMException('DiceBox has been destroyed', 'AbortError')
     }
     if(matParams.specularTexture){
       diceMatLight.specularTexture = await this.getTexture('specular', options)
+			if (this.#destroyed) throw new DOMException('DiceBox has been destroyed', 'AbortError')
     }
   
     diceMatLight.allowShaderHotSwapping = false
@@ -115,6 +125,7 @@ class ThemeLoader {
     if(matParams.diffuseTexture && matParams.diffuseTexture.dark){
       opts.material.diffuseTexture = options.material.diffuseTexture.dark
       diceMatDark.diffuseTexture = await this.getTexture('diffuse', opts)
+			if (this.#destroyed) throw new DOMException('DiceBox has been destroyed', 'AbortError')
     }
     // this must be set again for some reason - does not clone
     diceMatDark.AddAttribute('customColor')
@@ -130,18 +141,21 @@ class ThemeLoader {
       switch (type) {
         case "diffuse":
           texture = await this.importTextureAsync(`${basePath}/${matParams[textureKey]}`, theme)
+			if (this.#destroyed) throw new DOMException('DiceBox has been destroyed', 'AbortError')
           if(matParams[level]) {
             texture.level = matParams[level]
           }
           break;
         case "bump":
           texture = await this.importTextureAsync(`${basePath}/${matParams[textureKey]}`, theme)
+			if (this.#destroyed) throw new DOMException('DiceBox has been destroyed', 'AbortError')
           if(matParams[level]) {
             texture.level = matParams[level]
           }
           break;
         case "specular":    
             texture = await this.importTextureAsync(`${basePath}/${matParams[textureKey]}`, theme)
+			if (this.#destroyed) throw new DOMException('DiceBox has been destroyed', 'AbortError')
             if(matParams.specularPower){
               texture.specularPower = matParams.specularPower
             }
@@ -151,27 +165,45 @@ class ThemeLoader {
           throw new Error(`Texture type: ${type} is not supported`)
       }
     } catch (error) {
+			if (this.#destroyed) throw error
       console.error(error)
     }
     return texture
   }
 
-  async importTextureAsync(url,theme) {
-    return new Promise((resolve, reject) => {
-      let fileName = url.match(/^(.*\/)(.*)$/)
-      let texture = new Texture(
-          url, // url: Nullable<string>
-          this.scene, // sceneOrEngine: Nullable<Scene | ThinEngine>
-          undefined, // noMipmapOrOptions?: boolean | ITextureCreationOptions
-          true, // invertY?: boolean
-          undefined, // samplingMode?: number
-          () => resolve(texture), // onLoad?: Nullable<() => void>
-          () => reject(`Unable to load texture '${fileName[2]}' for theme: '${theme}'. Check that your assetPath is configured correctly and that the files exist at path: '${fileName[1]}'`) // onError?: Nullable<(message?: string
-        )
-    }).catch(error => console.error(error))
-  }
+	async importTextureAsync(url, theme) {
+		if (this.#destroyed) throw new DOMException('DiceBox has been destroyed', 'AbortError')
+		return new Promise((resolve, reject) => {
+			const pending = {reject}
+			this.#pendingTextures.add(pending)
+			const texture = new Texture(url, this.scene, undefined, true, undefined,
+				() => {
+					this.#pendingTextures.delete(pending)
+					resolve(texture)
+				},
+				() => {
+					this.#pendingTextures.delete(pending)
+					reject(new Error(`Unable to load texture '${url}' for theme '${theme}'`))
+				})
+			pending.texture = texture
+		}).catch(error => {
+			if (this.#destroyed) throw error
+			console.error(error)
+		})
+	}
+
+	destroy() {
+		if (this.#destroyed) return
+		this.#destroyed = true
+		for (const pending of this.#pendingTextures) {
+			pending.texture?.dispose()
+			pending.reject(new DOMException('DiceBox has been destroyed', 'AbortError'))
+		}
+		this.#pendingTextures.clear()
+	}
 
   async load(options){
+		if (this.#destroyed) throw new DOMException('DiceBox has been destroyed', 'AbortError')
     const { material } = options
 
     if(material.type === "color") {
@@ -185,7 +217,7 @@ class ThemeLoader {
     //   await this.loadSemiTransparentMaterial(options)
     // }
     else {
-      console.error(`Material type: ${material.type} not supported`)
+      throw new Error(`Material type: ${material.type} not supported`)
     }
   }
 }

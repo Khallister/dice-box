@@ -6,6 +6,9 @@ class WorldOffScreen {
 	themeLoadedInit = false
 	pendingThemePromises = {}
 	#offscreenCanvas
+	#destroyed = false
+	#initReject
+	#failure
 	#OffscreenWorker
 	// onInitComplete = () => {} // init callback
 	onRollResult = () => {} // individual die callback
@@ -23,6 +26,7 @@ class WorldOffScreen {
 		// set a property on the worker to a promise that is resolve when the proper message is returned from the worker
 		this.#OffscreenWorker.init = new Promise((resolve, reject) => {
 			this.offscreenWorkerInit = resolve
+			this.#initReject = reject
 		})
 
 		this.initialized = this.#initScene(options)
@@ -41,7 +45,11 @@ class WorldOffScreen {
 
 		// handle messages from offscreen BabylonJS World
 		this.#OffscreenWorker.onmessage = (e) => {
+			if (this.#destroyed || this.#failure) return
 			switch( e.data.action ) {
+				case "error":
+					this.#fail(new Error(e.data.message || 'DiceBox rendering worker failed'))
+					break;
 				case "init-complete":
 					this.offscreenWorkerInit() //fulfill promise so other things can run
 					break;
@@ -49,7 +57,8 @@ class WorldOffScreen {
 					break;
 				case "theme-loaded":
 					if(e.data.id){
-						this.pendingThemePromises[e.data.id](e.data.id)
+						this.pendingThemePromises[e.data.id]?.resolve(e.data.id)
+						delete this.pendingThemePromises[e.data.id]
 					}
 					break;
 				case 'roll-result':
@@ -64,7 +73,13 @@ class WorldOffScreen {
 			}
 		}
 		// await Promise.all([this.#OffscreenWorker.init])
+		this.#OffscreenWorker.onerror = event => {
+			if (!this.#destroyed) this.#fail(new Error(event.message || 'DiceBox rendering worker failed'))
+		}
+
 		await this.#OffscreenWorker.init
+		if (this.#destroyed) return
+		if (this.#failure) throw this.#failure
 
 		this.onInitComplete(true)
 
@@ -72,6 +87,7 @@ class WorldOffScreen {
 	}
 
 	connect(port){
+		if (this.#destroyed) { port.close(); return }
 		// Setup the connection: Port 1 is for this.#OffscreenWorker
 		this.#OffscreenWorker.postMessage({
 			action : "connect",
@@ -80,41 +96,72 @@ class WorldOffScreen {
 	}
 
 	updateConfig(options){
+		if (this.#destroyed) return
 		this.#OffscreenWorker.postMessage({action: "updateConfig", options});
 	}
 
 	resize(options){
+		if (this.#destroyed) return
 		this.#OffscreenWorker.postMessage({action: "resize", options});
 	}
 
 	async loadTheme(options) {
-		// prevent multiple requests of the same theme
-		return new Promise((resolve, reject) => {
-			if(Object.keys(this.pendingThemePromises).includes(options.theme)) {
-				return resolve()
-			}
-
-			this.pendingThemePromises[options.theme] = resolve
+		if (this.#destroyed) return
+		if (this.#failure) throw this.#failure
+		if (this.pendingThemePromises[options.theme]) return this.pendingThemePromises[options.theme].promise
+		const pending = {}
+		pending.promise = new Promise((resolve, reject) => Object.assign(pending, {resolve, reject}))
+		this.pendingThemePromises[options.theme] = pending
+		try {
 			this.#OffscreenWorker.postMessage({action: "loadTheme", options})
-		}).catch(error => console.error(error))
+		} catch (error) {
+			delete this.pendingThemePromises[options.theme]
+			pending.reject(error)
+		}
+		return pending.promise
+	}
+
+	#fail(error) {
+		this.#failure = error
+		this.#initReject(error)
+		for (const pending of Object.values(this.pendingThemePromises)) pending.reject(error)
+		this.pendingThemePromises = {}
 	}
 
 	clear(){
+		if (this.#destroyed) return
 		this.#OffscreenWorker.postMessage({action: "clearDice"})
 	}
 
 	add(options){
+		if (this.#destroyed) return
 		this.#OffscreenWorker.postMessage({action: "addDie", options})
 	}
 	
 	addNonDie(options){
+		if (this.#destroyed) return
 		this.#OffscreenWorker.postMessage({action: "addNonDie", options})
 	}
 
 	remove(options){
+		if (this.#destroyed) return
 		// remove the die from the render
 		this.#OffscreenWorker.postMessage({action: "removeDie", options})
 	}
+	// Terminating the worker releases its scene, engine, timers and transferred port.
+	destroy() {
+		if (this.#destroyed) return
+		this.#destroyed = true
+		this.#OffscreenWorker.onmessage = null
+		this.#OffscreenWorker.onerror = null
+		this.#OffscreenWorker.terminate()
+		this.offscreenWorkerInit?.()
+		for (const pending of Object.values(this.pendingThemePromises)) pending.resolve()
+		this.pendingThemePromises = {}
+		this.#offscreenCanvas = undefined
+		this.onInitComplete = this.onRollResult = this.onRollComplete = this.onDieRemoved = () => {}
+	}
+
 }
 
 export default WorldOffScreen

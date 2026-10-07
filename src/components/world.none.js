@@ -7,6 +7,7 @@ class WorldNone {
 	#count = 0
 	#sleeperCount = 0
 	#dieRollTimer = []
+	#destroyed = false
 	#rollCompleteTimer
 	noop = () => {}
 	constructor(options){
@@ -35,10 +36,12 @@ class WorldNone {
 	}
 
 	updateConfig(options){
+		if (this.#destroyed) return
 		Object.assign(this.config, options)
 	}
 
 	addNonDie(die){
+		if (this.#destroyed) return
 		console.log('die', die)
 		clearTimeout(this.#rollCompleteTimer)
 		const {id, value, ...rest} = die
@@ -60,11 +63,13 @@ class WorldNone {
 	}
 
 	add(die){
+		if (this.#destroyed) return
 		console.log("add die")
 		this.addNonDie(die)
 	}
 
 	remove(data){
+		if (this.#destroyed) return
 		console.log("remove die")
 		// TODO: test this with exploding dice
 		const dieData = this.#dieCache[data.id]
@@ -86,6 +91,7 @@ class WorldNone {
 	}
 
 	clear(){
+		if (this.#destroyed) return
 		if(!Object.keys(this.#dieCache).length && !this.#sleeperCount) {
 			return
 		}
@@ -106,11 +112,13 @@ class WorldNone {
 
 	// handle the position updates from the physics worker. It's a simple flat array of numbers for quick and easy transfer
 	async handleAsleep(die){
+		if (this.#destroyed) return
 		// mark this die as asleep
 		die.asleep = true
 	
 		// get the roll result for this die
 		await Dice.getRollResult(die)
+		if (this.#destroyed) return
 	
 		if(die.d10Instance || die.dieParent) {
 			// if one of the pair is asleep and the other isn't then it falls through without getting the roll result
@@ -142,6 +150,17 @@ class WorldNone {
 		// add to the sleeper count
 		this.#sleeperCount++
 	}
+	destroy() {
+		if (this.#destroyed) return
+		this.#destroyed = true
+		this.#dieRollTimer.forEach(timer => clearTimeout(timer))
+		clearTimeout(this.#rollCompleteTimer)
+		this.#dieRollTimer = []
+		this.#dieCache = {}
+		this.#count = this.#sleeperCount = 0
+		this.onInitComplete = this.onThemeLoaded = this.onRollResult = this.onRollComplete = this.onDieRemoved = this.noop
+	}
+
 }
 
 export default WorldNone

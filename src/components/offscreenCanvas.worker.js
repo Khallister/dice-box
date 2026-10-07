@@ -4,6 +4,7 @@ let WorldOffscreen
 
 // these are messages sent to this worker from World.js
 self.onmessage = async (e) => {
+  try {
   switch( e.data.action ) {
     case "rollDie":
       // kick it over to the physics worker
@@ -18,7 +19,7 @@ self.onmessage = async (e) => {
 			WorldOffscreen.addNonDie(e.data.options)
       break
 		case "loadTheme":
-			await WorldOffscreen.loadTheme(e.data.options).catch(error => console.error(error))
+			await WorldOffscreen.loadTheme(e.data.options)
 			break
     case "clearDice":
 			WorldOffscreen.clear()
@@ -52,6 +53,7 @@ self.onmessage = async (e) => {
 					self.postMessage({action:"die-removed", rollId})
 				}
 			})
+      await WorldOffscreen.initialized
       break
 		case "updateConfig":
 			WorldOffscreen.updateConfig(e.data.options)
@@ -63,4 +65,8 @@ self.onmessage = async (e) => {
     default:
       console.error("action not found in offscreen worker")
   }
+  } catch (error) {
+    self.postMessage({action: 'error', message: error?.message || String(error)})
+  }
+
 }

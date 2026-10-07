@@ -23,6 +23,9 @@ class WorldOnscreen {
 	#themeLoader
 	#physicsWorkerPort
 	#meshList = {}
+	#destroyed = false
+	#transferFrame
+	#abortController = new AbortController()
 	noop = () => {}
 	diceBufferView = new Float32Array(8000)
 
@@ -70,6 +73,7 @@ class WorldOnscreen {
 	}
 
 	connect(port){
+		if (this.#destroyed) { port.close(); return }
 		this.#physicsWorkerPort = port
 
 		this.#physicsWorkerPort.postMessage({
@@ -78,6 +82,7 @@ class WorldOnscreen {
 		}, [this.diceBufferView.buffer])
 
 		this.#physicsWorkerPort.onmessage = (e) => {
+			if (this.#destroyed) return
 			switch (e.data.action) {
 				case "updates": // dice status/position updates from physics worker
 					this.updatesFromPhysics(e.data.diceBuffer)
@@ -91,6 +96,7 @@ class WorldOnscreen {
 	}
 
 	updateConfig(options){
+		if (this.#destroyed) return
 		const prevConfig = this.config
 		this.config = options
 		// check if shadows setting has changed
@@ -129,6 +135,7 @@ class WorldOnscreen {
 
 	// all this does is start the render engine.
 	render(newStartPoint) {
+		if (this.#destroyed) return
 		// document.body.addEventListener('click',()=>engine.stopRenderLoop())
 		this.#engine.runRenderLoop(this.renderLoop.bind(this))
 		this.#physicsWorkerPort.postMessage({
@@ -138,6 +145,7 @@ class WorldOnscreen {
 	}
 
 	renderLoop() {
+		if (this.#destroyed) return
 		// if no dice are awake then stop the render loop and save some CPU power
 		if(this.#sleeperCount && this.#sleeperCount === Object.keys(this.#dieCache).length) {
 			// console.log(`no dice moving`)
@@ -158,18 +166,20 @@ class WorldOnscreen {
 	}
 
 	async loadTheme(options) {
+		if (this.#destroyed) return
 		// await loadTheme(theme, this.config.origin + this.config.assetPath, this.#scene)
 		const {theme, basePath, material, meshFilePath, meshName} = options
 		// load the textures and create the materials needed for this theme
 		await this.#themeLoader.load({theme,basePath,material})
+		if (this.#destroyed) return
 	
 		// Load the 3D meshes declared by the theme and return the collider mesh data to be passed on to the physics worker
 		// don't load same models twice
 		if(!Object.keys(this.#meshList).includes(meshName)){
-			this.#meshList[meshName] = meshFilePath
-			const colliders = await Dice.loadModels({meshFilePath,meshName}, this.#scene)
+			const colliders = await Dice.loadModels({meshFilePath,meshName, signal: this.#abortController.signal}, this.#scene)
+			if (this.#destroyed) return
 
-			if(!colliders){
+			if (!colliders?.length) {
 				throw new Error("No colliders returned from the 3D mesh file. Low poly colliders are expected to be in the same file as the high poly dice and the mesh name contains the word 'collider'")
 			}
 		
@@ -180,12 +190,14 @@ class WorldOnscreen {
 					meshName
 				}
 			})
+			this.#meshList[meshName] = meshFilePath
 		}
 
 		this.onThemeLoaded({id: theme})
 	}
 
 	clear() {
+		if (this.#destroyed) return
 		if(!Object.keys(this.#dieCache).length && !this.#sleeperCount) {
 			return
 		}
@@ -211,8 +223,10 @@ class WorldOnscreen {
 	}
 
 	add(options) {
+		if (this.#destroyed) return
 		// loadDie allows you to specify sides(dieType) and theme and returns the options you passed in
 		Dice.loadDie(options, this.#scene).then(resp => {
+			if (this.#destroyed) return
 			// space out adding the dice so they don't lump together too much
 			this.#dieRollTimer.push(setTimeout(() => {
 				this.#add(resp)
@@ -221,6 +235,7 @@ class WorldOnscreen {
 	}
 
 	addNonDie(die){
+		if (this.#destroyed) return
 		if(this.#engine.activeRenderLoops.length === 0) {
 			this.render(false)
 		}
@@ -233,15 +248,17 @@ class WorldOnscreen {
 		this.#dieCache[id] = newDie
 		
 		// double timeout to ensure any real dice have a chance to queue up and rollResults isn't triggered right away
-		setTimeout(()=>{
+		this.#dieRollTimer.push(setTimeout(()=>{
+			if (this.#destroyed) return
 			this.#dieRollTimer.push(setTimeout(() => {
 				this.handleAsleep(newDie)
 			}, this.#count++ * this.config.delay))
-		}, 10)
+		}, 10))
 	}
 
 	// add a die to the scene
 	async #add(options) {
+		if (this.#destroyed) return
 		if(this.#engine.activeRenderLoops.length === 0) {
 			this.render(options.newStartPoint)
 		}
@@ -275,11 +292,13 @@ class WorldOnscreen {
 		if(options.sides === 100 && options.data !== 'single') {
 			// assign the new die to a property on the d100 - spread the options in order to pass a matching theme
 			newDie.d10Instance = await Dice.loadDie({...diceOptions, dieType: 'd10', sides: 10, id: newDie.id + 10000}, this.#scene).then( response =>  {
+				if (this.#destroyed) return
 				const d10Instance = new Dice(response, this.#scene)
 				// identify the parent of this d10 so we can calculate the roll result later
 				d10Instance.dieParent = newDie
 				return d10Instance
 			})
+			if (this.#destroyed) return
 			// add the d10 to the cache and ask the physics worker for a collider
 			this.#dieCache[`${newDie.d10Instance.id}`] = newDie.d10Instance
 			this.#physicsWorkerPort.postMessage({
@@ -300,6 +319,7 @@ class WorldOnscreen {
 	}
 	
 	remove(data) {
+		if (this.#destroyed) return
 	// TODO: test this with exploding dice
 	const dieData = this.#dieCache[data.id]
 	
@@ -337,6 +357,7 @@ class WorldOnscreen {
 }
 	
 	updatesFromPhysics(buffer) {
+		if (this.#destroyed) return
 		this.diceBufferView = new Float32Array(buffer)
 		let bufferIndex = 1
 
@@ -370,7 +391,9 @@ class WorldOnscreen {
 	}
 
 	// transfer the buffer back to physics worker
-	requestAnimationFrame(()=>{
+	this.#transferFrame = requestAnimationFrame(()=>{
+		this.#transferFrame = undefined
+		if (this.#destroyed) return
 		this.#physicsWorkerPort.postMessage({
 			action: "stepSimulation",
 			diceBuffer: this.diceBufferView.buffer
@@ -380,16 +403,21 @@ class WorldOnscreen {
 	
 	// handle the position updates from the physics worker. It's a simple flat array of numbers for quick and easy transfer
 	async handleAsleep(die){
+		if (this.#destroyed) return
 		// mark this die as asleep
 		die.asleep = true
 	
 		// get the roll result for this die
 		await Dice.getRollResult(die, this.#scene)
-	
+		if (this.#destroyed) return
+		// the value is only usable once the async face lookup above has finished
+		die.resultReady = true
+
 		if(die.d10Instance || die.dieParent) {
-			// if one of the pair is asleep and the other isn't then it falls through without getting the roll result
-			// otherwise both dice in the d100 are asleep and ready to calc their roll result
-			if(die?.d10Instance?.asleep || die?.dieParent?.asleep) {
+			// if the other die of the pair has no result yet it falls through without reporting;
+			// the second die to finish its lookup combines both values. Checking `asleep` here raced:
+			// both halves can fall asleep in the same frame, before the partner's value is set.
+			if(die?.d10Instance?.resultReady || die?.dieParent?.resultReady) {
 				const d100 = die.config.sides === 100 ? die : die.dieParent
 				const d10 = die.config.sides === 10 ? die : die.d10Instance
 				if(d100.rawValue){
@@ -421,12 +449,36 @@ class WorldOnscreen {
 	}
 	
 	resize(options) {
+		if (this.#destroyed) return
 		// redraw the dicebox
 		const width = this.#canvas.width = options.width
 		const height = this.#canvas.height = options.height
 		this.#container.create({aspect: width / height})
 		this.#engine.resize()
+		if (!this.#destroyed && !this.#scene.isDisposed) this.#scene.render()
 	}
+	destroy() {
+		if (this.#destroyed) return
+		this.#destroyed = true
+		this.#abortController.abort()
+		this.#dieRollTimer.forEach(timer => clearTimeout(timer))
+		this.#dieRollTimer = []
+		if (this.#transferFrame !== undefined) cancelAnimationFrame(this.#transferFrame)
+		this.#transferFrame = undefined
+		if (this.#physicsWorkerPort) {
+			this.#physicsWorkerPort.onmessage = null
+			this.#physicsWorkerPort.close()
+		}
+		this.#themeLoader?.destroy()
+		this.#engine?.stopRenderLoop()
+		this.#scene?.dispose()
+		this.#engine?.dispose()
+		this.#dieCache = {}
+		this.#meshList = {}
+		this.#count = this.#sleeperCount = 0
+		this.onInitComplete = this.onThemeLoaded = this.onRollResult = this.onRollComplete = this.onDieRemoved = this.noop
+	}
+
 }
 
 export default WorldOnscreen

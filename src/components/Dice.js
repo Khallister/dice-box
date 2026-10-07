@@ -107,13 +107,13 @@ class Dice {
   // load all the dice models
   static async loadModels(options, scene) {
     // can we get scene without passing it in?
-    const {meshFilePath, meshName, scale, d4FaceDown = true} = options
+    const {meshFilePath, meshName, scale, d4FaceDown = true, signal} = options
     let has_d100 = false
     let has_d10 = false
 
     //TODO: cache model files so it won't have to be fetched by other themes using the same models
     // using fetch to get modelData so we can pull out data unrelated to mesh importing
-    const modelData = await fetch(`${meshFilePath}`).then(resp => {
+    const modelData = await fetch(`${meshFilePath}`, {signal}).then(resp => {
       if(resp.ok) {
         const contentType = resp.headers.get("content-type")
         if (contentType && contentType.indexOf("application/json") !== -1) {
@@ -129,13 +129,18 @@ class Dice {
       } else {
         throw new Error(`Unable to load 3D mesh file: '${meshFilePath}'. Request rejected with status ${resp.status}: ${resp.statusText}`)
       }
-    }).catch(error => console.error(error))
+    })
 
-    if(!modelData){
-      return
+    if (signal?.aborted || scene.isDisposed) throw new DOMException('DiceBox has been destroyed', 'AbortError')
+    if (!modelData?.meshes || !modelData.colliderFaceMap) {
+      throw new Error(`Invalid dice model data: ${meshFilePath}`)
     }
 
-    SceneLoader.ImportMeshAsync(null,null, 'data:' + JSON.stringify(modelData) , scene).then(data => {
+    await SceneLoader.ImportMeshAsync(null,null, 'data:' + JSON.stringify(modelData) , scene).then(data => {
+      if (signal?.aborted || scene.isDisposed) {
+        data.meshes.forEach(mesh => mesh.dispose())
+        throw new DOMException('DiceBox has been destroyed', 'AbortError')
+      }
       data.meshes.forEach(model => {
         if(model.name === "__root__") {
           model.dispose()
@@ -186,7 +191,7 @@ class Dice {
       scene.themeData[meshName] = {}
       scene.themeData[meshName].colliderFaceMap = modelData.colliderFaceMap
       scene.themeData[meshName].d4FaceDown = d4FaceDown
-    }).catch(error => console.error(error))
+    })
     // return collider data so it can be passed to physics
     // TODO: return any physics settings as well
     return modelData.meshes.filter(model => model.name.includes("collider"))

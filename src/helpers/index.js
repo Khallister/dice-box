@@ -39,7 +39,7 @@ export const debounce = (fn) => {
 	let timeout;
 
 	// Return a function to run debounced
-	return function () {
+	const debounced = function () {
 
 		// Setup the arguments
 		let context = this;
@@ -52,9 +52,15 @@ export const debounce = (fn) => {
 
 		// Setup the new requestAnimationFrame()
 		timeout = window.requestAnimationFrame(function () {
+			timeout = undefined;
 			fn.apply(context, args);
 		});
 	};
+	debounced.cancel = () => {
+		if (timeout !== undefined) window.cancelAnimationFrame(timeout);
+		timeout = undefined;
+	};
+	return debounced;
 }
 
 /**
